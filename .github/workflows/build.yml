@@ -1,0 +1,250 @@
+# 构建发布工作流（公开仓库）
+#
+# 触发方式：由私有源码仓库通过 repository_dispatch 或 workflow_dispatch 触发
+# 产物：编译好的安装包 + latest.json 发布到本仓库 Release
+#
+# 所需 Secrets（在公开仓库 Settings → Secrets and variables → Actions 中配置）：
+#   SOURCE_REPO_TOKEN           - 有私有源码仓库 read 权限的 PAT（classic token，勾选 repo）
+#   TAURI_SIGNING_PRIVATE_KEY   - tauri signer generate 生成的私钥内容
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD - 私钥密码（没有则留空）
+
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v1.0.1）'
+        required: true
+
+env:
+  # 私有源码仓库
+  SOURCE_REPO: okay-workspaces/okay-nano-tokilum
+  # 应用名称，与 tauri.conf.json 中 productName 一致
+  APP_NAME: okay-nano-tokilum
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 各平台并行构建
+  # ─────────────────────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            os-name: windows-x86_64
+          - platform: macos-14
+            target: x86_64-apple-darwin
+            os-name: darwin-x86_64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            os-name: darwin-aarch64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            os-name: linux-x86_64
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source from private repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Verify tag matches tauri.conf.json version
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          CONF_VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          if [ "v$CONF_VERSION" != "$TAG" ]; then
+            echo "::error::tag ($TAG) 与 tauri.conf.json 版本 (v$CONF_VERSION) 不一致，请先运行 pnpm release 同步版本"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable corepack (uses packageManager from package.json)
+        run: corepack enable
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Cache ONNX Runtime binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ort
+            ~/Library/Caches/ort
+            ~\AppData\Local\ort
+          key: ort-binaries-${{ matrix.target }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ort-binaries-${{ matrix.target }}-
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libasound2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          args: --target ${{ matrix.target }}
+          # 不在这里创建 GitHub Release，产物收集后统一发布
+          tagName: ''
+          releaseName: ''
+          releaseBody: ''
+          releaseDraft: false
+          prerelease: false
+
+      - name: Collect build artifacts
+        id: collect
+        shell: bash
+        run: |
+          BUNDLE_DIR="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          UPLOAD_DIR="upload-${{ matrix.os-name }}"
+          mkdir -p "$UPLOAD_DIR"
+
+          case "${{ matrix.platform }}" in
+            windows-latest)
+              find "$BUNDLE_DIR" \( -name "*.exe" -o -name "*.msi" \) | while read f; do
+                cp "$f" "$UPLOAD_DIR/" 2>/dev/null || true
+                { [ -f "${f}.sig" ] && cp "${f}.sig" "$UPLOAD_DIR/"; } || true
+              done
+              ;;
+            macos-14|macos-latest)
+              find "$BUNDLE_DIR" \( -name "*.dmg" -o -name "*.app.tar.gz" \) | while read f; do
+                cp "$f" "$UPLOAD_DIR/" 2>/dev/null || true
+                { [ -f "${f}.sig" ] && cp "${f}.sig" "$UPLOAD_DIR/"; } || true
+              done
+              ;;
+            ubuntu-22.04)
+              find "$BUNDLE_DIR" \( -name "*.AppImage" -o -name "*.deb" \) | while read f; do
+                cp "$f" "$UPLOAD_DIR/" 2>/dev/null || true
+                { [ -f "${f}.sig" ] && cp "${f}.sig" "$UPLOAD_DIR/"; } || true
+              done
+              ;;
+          esac
+
+          ls -la "$UPLOAD_DIR"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.os-name }}
+          path: upload-${{ matrix.os-name }}/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # 所有平台构建完成后，统一发布 Release
+  # ─────────────────────────────────────────────
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source (for CHANGELOG and scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: false
+
+      - name: List collected artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: Generate latest.json
+        run: node .github/scripts/generate-latest-json.mjs
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          RELEASE_REPO: ${{ github.repository }}
+          APP_NAME: ${{ env.APP_NAME }}
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+
+          # 提取 CHANGELOG 中本版本的 notes
+          NOTES=$(awk "/^## \[?${TAG#v}\]?/{found=1; next} found && /^## /{exit} found{print}" apps/desktop/CHANGELOG.md 2>/dev/null || echo "详见仓库更新记录。")
+
+          # 创建 Release（draft，上传完成后发布）；已存在则跳过
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，跳过创建"
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "Nano Tokilum $TAG" \
+              --notes "$NOTES" \
+              --draft
+          fi
+
+      - name: Upload installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          # 上传所有安装包和签名文件（排除 latest.json，最后单独上传）
+          find artifacts/ -type f ! -name "latest.json" | while read f; do
+            gh release upload "$TAG" "$f" \
+              --repo "${{ github.repository }}" \
+              --clobber
+          done
+
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" latest.json \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
