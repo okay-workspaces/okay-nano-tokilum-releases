@@ -4,7 +4,7 @@
 # 产物：编译好的安装包 + latest.json 发布到本仓库 Release
 #
 # 所需 Secrets（在公开仓库 Settings → Secrets and variables → Actions 中配置）：
-#   SOURCE_REPO_TOKEN           - 有私有源码仓库 read 权限的 PAT（classic token，勾选 repo）
+#   V2_SOURCE_REPO_TOKEN        - 有私有源码仓库 read 权限的 PAT（classic token，勾选 repo）
 #   TAURI_SIGNING_PRIVATE_KEY   - tauri signer generate 生成的私钥内容
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD - 私钥密码（没有则留空）
 
@@ -54,7 +54,7 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ github.event.inputs.tag }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          token: ${{ secrets.V2_SOURCE_REPO_TOKEN }}
 
       - name: Verify tag matches tauri.conf.json version
         shell: bash
@@ -178,7 +178,7 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ github.event.inputs.tag }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          token: ${{ secrets.V2_SOURCE_REPO_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
